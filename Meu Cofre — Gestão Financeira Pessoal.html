@@ -1,0 +1,1166 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Meu Cofre — Gestão Financeira Pessoal</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<script src="https://cdn.tailwindcss.com"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prop-types/15.8.1/prop-types.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/recharts/2.12.7/Recharts.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.24.7/babel.min.js"></script>
+<style>
+  body { font-family: 'Archivo', system-ui, sans-serif; }
+  .tabular-nums { font-variant-numeric: tabular-nums; }
+</style>
+</head>
+<body class="bg-stone-100">
+<div id="root"></div>
+
+<script type="text/babel" data-presets="env,react">
+const { useState, useEffect, useMemo } = React;
+const {
+  PieChart, Pie, Cell, BarChart, Bar, LineChart, Line, XAxis, YAxis,
+  Tooltip, ResponsiveContainer, Legend, CartesianGrid,
+} = Recharts;
+
+/* ============================================================
+   MODELO DE DADOS — salvo no localStorage do navegador
+   ============================================================ */
+const STORAGE_KEY = "meu-cofre-v3-completo";
+const uid = () => Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
+
+const DEFAULT_DATA = {
+  accounts: [{ id: "acc-1", name: "Conta Principal", initialBalance: 0 }],
+  cards: [],
+  categories: [
+    { id: "cat-alim", name: "Alimentação", teto: 0, subs: [] },
+    { id: "cat-deli", name: "Delivery", teto: 0, subs: [] },
+    { id: "cat-roup", name: "Roupas", teto: 0, subs: [] },
+    { id: "cat-alug", name: "Aluguel", teto: 0, subs: [] },
+    { id: "cat-merc", name: "Mercado", teto: 0, subs: [] },
+    { id: "cat-laze", name: "Lazer", teto: 0, subs: [] },
+    { id: "cat-carr", name: "Carro", teto: 0, subs: ["Financiamento", "Seguro", "Gasolina"] },
+  ],
+  investments: [],
+  transactions: [],
+  settings: { cdiAnual: 14.9 }, // % a.a. — edite na aba Investimentos
+};
+
+/* ============================================================
+   UTILITÁRIOS
+   ============================================================ */
+const fmtBRL = (v) =>
+  new Intl.NumberFormat("pt-BR", { style: "currency", currency: "BRL" }).format(v || 0);
+
+const parseValor = (s) => {
+  if (typeof s === "number") return s;
+  const n = parseFloat(String(s).replace(/\./g, "").replace(",", "."));
+  return isNaN(n) ? 0 : n;
+};
+
+const monthKey = (dateStr) => dateStr.slice(0, 7);
+
+const todayISO = () => {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+};
+
+const monthLabel = (mk) => {
+  const [y, m] = mk.split("-").map(Number);
+  return new Date(y, m - 1, 1).toLocaleDateString("pt-BR", { month: "long", year: "numeric" });
+};
+
+const shiftMonth = (mk, delta) => {
+  const [y, m] = mk.split("-").map(Number);
+  const d = new Date(y, m - 1 + delta, 1);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
+};
+
+const monthsBetween = (mkFrom, mkTo) => {
+  const [y1, m1] = mkFrom.split("-").map(Number);
+  const [y2, m2] = mkTo.split("-").map(Number);
+  return (y2 - y1) * 12 + (m2 - m1);
+};
+
+function txsForMonth(transactions, mk) {
+  const out = [];
+  for (const t of transactions) {
+    const tm = monthKey(t.data);
+    if (tm === mk) out.push({ ...t, projected: false });
+    else if (t.recorrente && tm < mk) {
+      const day = t.data.slice(8, 10);
+      out.push({ ...t, projected: true, data: `${mk}-${day}` });
+    }
+  }
+  return out.sort((a, b) => (a.data < b.data ? 1 : -1));
+}
+
+function occurrencesUpTo(t, currentMk) {
+  const tm = monthKey(t.data);
+  if (tm > currentMk) return 0;
+  if (!t.recorrente) return 1;
+  return monthsBetween(tm, currentMk) + 1;
+}
+
+// Taxa mensal efetiva a partir do CDI anual e do % do CDI do investimento
+const taxaMensal = (cdiAnual, pctCdi) =>
+  (Math.pow(1 + cdiAnual / 100, 1 / 12) - 1) * (pctCdi / 100);
+
+// Valor atual de um investimento: inicial + aportes, com juros compostos mensais
+function valorInvestimento(inv, transactions, cdiAnual, mkRef) {
+  const i = taxaMensal(cdiAnual, inv.pctCdi);
+  let total = 0;
+  const nIni = Math.max(monthsBetween(monthKey(inv.dataInicio), mkRef), 0);
+  total += inv.valorInicial * Math.pow(1 + i, nIni);
+  let aportado = inv.valorInicial;
+  for (const t of transactions) {
+    if (t.type !== "investimento" || t.investimentoId !== inv.id) continue;
+    const tm = monthKey(t.data);
+    const occ = t.recorrente ? Math.max(monthsBetween(tm, mkRef), -1) + 1 : (tm <= mkRef ? 1 : 0);
+    for (let k = 0; k < occ; k++) {
+      const mkAporte = shiftMonth(tm, k);
+      if (mkAporte > mkRef) break;
+      const n = monthsBetween(mkAporte, mkRef);
+      total += t.valor * Math.pow(1 + i, n);
+      aportado += t.valor;
+    }
+  }
+  return { atual: total, aportado, rendimento: total - aportado };
+}
+
+const PIE_COLORS = ["#1E6B4E", "#2E9E6B", "#E0A426", "#C6423C", "#3B6FB5", "#7C5CBF", "#B5651D", "#4A8A8C", "#8C4A6B", "#5C7C3B"];
+
+/* ============================================================
+   ÍCONES (SVG inline, sem dependências)
+   ============================================================ */
+const Icon = ({ d, size = 18, className = "" }) => (
+  <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor"
+    strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={className}>
+    {d}
+  </svg>
+);
+const I = {
+  plus: <><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></>,
+  x: <><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></>,
+  pencil: <><path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/></>,
+  trash: <><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></>,
+  repeat: <><polyline points="17 1 21 5 17 9"/><path d="M3 11V9a4 4 0 0 1 4-4h14"/><polyline points="7 23 3 19 7 15"/><path d="M21 13v2a4 4 0 0 1-4 4H3"/></>,
+  left: <polyline points="15 18 9 12 15 6"/>,
+  right: <polyline points="9 18 15 12 9 6"/>,
+  wallet: <><path d="M21 12V7H5a2 2 0 0 1 0-4h14v4"/><path d="M3 5v14a2 2 0 0 0 2 2h16v-5"/><path d="M18 12a2 2 0 0 0 0 4h4v-4Z"/></>,
+  card: <><rect x="1" y="4" width="22" height="16" rx="2"/><line x1="1" y1="10" x2="23" y2="10"/></>,
+  dash: <><rect x="3" y="3" width="7" height="9"/><rect x="14" y="3" width="7" height="5"/><rect x="14" y="12" width="7" height="9"/><rect x="3" y="16" width="7" height="5"/></>,
+  list: <><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></>,
+  tag: <><path d="M20.59 13.41 11 3.83A2 2 0 0 0 9.59 3.24H4a2 2 0 0 0-2 2v5.59c0 .53.21 1.04.59 1.41l9.58 9.59a2 2 0 0 0 2.83 0l5.59-5.59a2 2 0 0 0 0-2.83Z"/><circle cx="7.5" cy="8.5" r="1"/></>,
+  trendUp: <><polyline points="23 6 13.5 15.5 8.5 10.5 1 18"/><polyline points="17 6 23 6 23 12"/></>,
+  trendDown: <><polyline points="23 18 13.5 8.5 8.5 13.5 1 6"/><polyline points="17 18 23 18 23 12"/></>,
+  pig: <><path d="M19 8a7 7 0 1 0-13.6 2.3C4.5 11.5 4 13 4 13H2v4h2.5c.6 1 1.5 1.9 2.5 2.4V21h3v-1h4v1h3v-1.7c1.8-1 3-2.9 3-5V12h2V8h-2.3"/><circle cx="15" cy="10" r="0.5" fill="currentColor"/></>,
+  chart: <><line x1="12" y1="20" x2="12" y2="10"/><line x1="18" y1="20" x2="18" y2="4"/><line x1="6" y1="20" x2="6" y2="16"/></>,
+  alert: <><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0Z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></>,
+  check: <polyline points="20 6 9 17 4 12"/>,
+};
+
+/* ============================================================
+   COMPONENTES DE APOIO
+   ============================================================ */
+const inputCls = "w-full border border-stone-300 rounded-xl px-3 py-2.5 text-stone-800 focus:outline-none focus:ring-2 focus:ring-emerald-600 focus:border-emerald-600 bg-white";
+const labelCls = "block text-sm font-medium text-stone-600 mb-1";
+const btnPrimary = "bg-emerald-700 hover:bg-emerald-800 text-white font-semibold rounded-xl px-4 py-2.5 transition-colors";
+const btnGhost = "text-stone-600 hover:bg-stone-100 font-medium rounded-xl px-4 py-2.5 transition-colors";
+
+function Card({ children, className = "" }) {
+  return <div className={`bg-white rounded-2xl border border-stone-200 shadow-sm ${className}`}>{children}</div>;
+}
+
+function ProgressBar({ gasto, teto }) {
+  const pct = teto > 0 ? (gasto / teto) * 100 : 0;
+  const width = Math.min(pct, 100);
+  let barColor = "bg-emerald-600", textColor = "text-emerald-700";
+  if (pct >= 100) { barColor = "bg-red-600"; textColor = "text-red-700"; }
+  else if (pct >= 70) { barColor = "bg-amber-500"; textColor = "text-amber-600"; }
+  return (
+    <div>
+      <div className="h-3 w-full bg-stone-200 rounded-full overflow-hidden">
+        <div className={`h-full rounded-full ${barColor} transition-all duration-500`} style={{ width: width + "%" }} />
+      </div>
+      <div className="flex justify-between mt-1 text-xs">
+        <span className={`font-semibold tabular-nums ${textColor}`}>{fmtBRL(gasto)} ({pct.toFixed(0)}%)</span>
+        <span className="text-stone-500 tabular-nums">
+          {teto > 0 ? (gasto <= teto ? `faltam ${fmtBRL(teto - gasto)}` : `${fmtBRL(gasto - teto)} acima do teto`) : "sem teto definido"}
+        </span>
+      </div>
+    </div>
+  );
+}
+
+function Modal({ title, onClose, children }) {
+  return (
+    <div className="fixed inset-0 z-50 flex items-end sm:items-center justify-center bg-black bg-opacity-40 p-0 sm:p-4" onClick={onClose}>
+      <div className="bg-white w-full sm:max-w-lg rounded-t-3xl sm:rounded-2xl max-h-full overflow-y-auto shadow-xl"
+        onClick={(e) => e.stopPropagation()}>
+        <div className="flex items-center justify-between px-5 py-4 border-b border-stone-200 sticky top-0 bg-white rounded-t-3xl sm:rounded-t-2xl">
+          <h2 className="text-lg font-bold text-stone-800">{title}</h2>
+          <button onClick={onClose} className="p-2 rounded-full hover:bg-stone-100" aria-label="Fechar"><Icon d={I.x} size={20} className="text-stone-500" /></button>
+        </div>
+        <div className="p-5">{children}</div>
+      </div>
+    </div>
+  );
+}
+
+/* ============================================================
+   FORMULÁRIO DE TRANSAÇÃO
+   ============================================================ */
+function TransactionForm({ data, initial, onSave, onClose }) {
+  const [tipo, setTipo] = useState(initial ? initial.type : "despesa");
+  const [valor, setValor] = useState(initial ? String(initial.valor).replace(".", ",") : "");
+  const [dataTx, setDataTx] = useState(initial ? initial.data : todayISO());
+  const [descricao, setDescricao] = useState(initial ? initial.descricao : "");
+  const [contaId, setContaId] = useState(initial ? initial.contaId : (data.accounts[0] ? "acc:" + data.accounts[0].id : ""));
+  const [categoriaId, setCategoriaId] = useState(initial ? initial.categoriaId : "");
+  const [sub, setSub] = useState(initial ? initial.subcategoria : "");
+  const [investimentoId, setInvestimentoId] = useState(initial ? (initial.investimentoId || "") : "");
+  const [recorrente, setRecorrente] = useState(initial ? initial.recorrente : false);
+  const [erro, setErro] = useState("");
+
+  const catSel = data.categories.find((c) => c.id === categoriaId);
+
+  const salvar = () => {
+    const v = parseValor(valor);
+    if (v <= 0) return setErro("Informe um valor maior que zero.");
+    if (!descricao.trim()) return setErro("Dê uma descrição à transação.");
+    if (!contaId) return setErro("Escolha uma conta ou cartão.");
+    if (tipo === "despesa" && !categoriaId) return setErro("Escolha uma categoria para a despesa.");
+    onSave({
+      id: initial && initial.id ? initial.id : uid(),
+      type: tipo,
+      valor: v,
+      data: dataTx,
+      descricao: descricao.trim(),
+      contaId,
+      categoriaId: tipo === "despesa" ? categoriaId : "",
+      subcategoria: tipo === "despesa" && catSel && catSel.subs.length ? sub : "",
+      investimentoId: tipo === "investimento" ? investimentoId : "",
+      recorrente,
+    });
+    onClose();
+  };
+
+  const tipos = [
+    { key: "despesa", label: "Despesa", cls: "bg-red-600" },
+    { key: "receita", label: "Receita", cls: "bg-emerald-600" },
+    { key: "investimento", label: "Investimento", cls: "bg-blue-600" },
+  ];
+
+  return (
+    <div className="space-y-4">
+      <div className="grid grid-cols-3 gap-2">
+        {tipos.map((t) => (
+          <button key={t.key} onClick={() => setTipo(t.key)}
+            className={`rounded-xl py-2.5 text-sm font-semibold transition-colors ${tipo === t.key ? t.cls + " text-white" : "bg-stone-100 text-stone-600 hover:bg-stone-200"}`}>
+            {t.label}
+          </button>
+        ))}
+      </div>
+
+      <div className="grid grid-cols-2 gap-3">
+        <div>
+          <label className={labelCls}>Valor (R$)</label>
+          <input className={inputCls} inputMode="decimal" placeholder="0,00" value={valor} onChange={(e) => setValor(e.target.value)} />
+        </div>
+        <div>
+          <label className={labelCls}>Data</label>
+          <input className={inputCls} type="date" value={dataTx} onChange={(e) => setDataTx(e.target.value)} />
+        </div>
+      </div>
+
+      <div>
+        <label className={labelCls}>Descrição</label>
+        <input className={inputCls} placeholder="Ex.: almoço, salário, aporte CDB…" value={descricao} onChange={(e) => setDescricao(e.target.value)} />
+      </div>
+
+      <div>
+        <label className={labelCls}>Conta / Cartão de origem</label>
+        <select className={inputCls} value={contaId} onChange={(e) => setContaId(e.target.value)}>
+          <option value="">Selecione…</option>
+          <optgroup label="Contas">
+            {data.accounts.map((a) => <option key={a.id} value={"acc:" + a.id}>{a.name}</option>)}
+          </optgroup>
+          {data.cards.length > 0 && (
+            <optgroup label="Cartões de crédito">
+              {data.cards.map((c) => <option key={c.id} value={"card:" + c.id}>{c.name}</option>)}
+            </optgroup>
+          )}
+        </select>
+      </div>
+
+      {tipo === "despesa" && (
+        <div className="grid grid-cols-2 gap-3">
+          <div className={catSel && catSel.subs.length ? "" : "col-span-2"}>
+            <label className={labelCls}>Categoria</label>
+            <select className={inputCls} value={categoriaId} onChange={(e) => { setCategoriaId(e.target.value); setSub(""); }}>
+              <option value="">Selecione…</option>
+              {data.categories.map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}
+            </select>
+          </div>
+          {catSel && catSel.subs.length > 0 && (
+            <div>
+              <label className={labelCls}>Detalhe</label>
+              <select className={inputCls} value={sub} onChange={(e) => setSub(e.target.value)}>
+                <option value="">Geral</option>
+                {catSel.subs.map((s) => <option key={s} value={s}>{s}</option>)}
+              </select>
+            </div>
+          )}
+        </div>
+      )}
+
+      {tipo === "investimento" && (
+        <div>
+          <label className={labelCls}>Aplicar em (aporte)</label>
+          <select className={inputCls} value={investimentoId} onChange={(e) => setInvestimentoId(e.target.value)}>
+            <option value="">— sem vínculo —</option>
+            {data.investments.map((inv) => <option key={inv.id} value={inv.id}>{inv.name}</option>)}
+          </select>
+          <p className="text-xs text-stone-400 mt-1">Vincule a um investimento cadastrado para o valor entrar no cálculo de rendimento e nas projeções.</p>
+        </div>
+      )}
+
+      <label className="flex items-center gap-3 cursor-pointer select-none">
+        <input type="checkbox" checked={recorrente} onChange={(e) => setRecorrente(e.target.checked)} className="w-5 h-5 accent-emerald-700" />
+        <span className="text-sm text-stone-700 flex items-center gap-1.5">
+          <Icon d={I.repeat} size={16} className="text-stone-500" /> Recorrente (repete todo mês — ex.: aporte mensal)
+        </span>
+      </label>
+
+      {erro && <p className="text-sm text-red-600 font-medium">{erro}</p>}
+
+      <div className="flex gap-2 justify-end pt-2">
+        <button className={btnGhost} onClick={onClose}>Cancelar</button>
+        <button className={btnPrimary} onClick={salvar}>{initial && initial.id ? "Salvar alterações" : "Adicionar"}</button>
+      </div>
+    </div>
+  );
+}
+
+/* ============================================================
+   VISÃO: INVESTIMENTOS
+   ============================================================ */
+function InvestimentosView({ data, setData, onAportar }) {
+  const [editing, setEditing] = useState(null);
+  const [nome, setNome] = useState("");
+  const [valorIni, setValorIni] = useState("");
+  const [dataIni, setDataIni] = useState(todayISO());
+  const [pctCdi, setPctCdi] = useState("100");
+  const [cdiField, setCdiField] = useState(String(data.settings.cdiAnual).replace(".", ","));
+  const [expandido, setExpandido] = useState(null);
+  const [simAporte, setSimAporte] = useState("");
+
+  const mkNow = monthKey(todayISO());
+  const cdi = data.settings.cdiAnual;
+
+  const abrir = (inv = null) => {
+    setEditing(inv || {});
+    setNome(inv ? inv.name : "");
+    setValorIni(inv ? String(inv.valorInicial).replace(".", ",") : "");
+    setDataIni(inv ? inv.dataInicio : todayISO());
+    setPctCdi(inv ? String(inv.pctCdi) : "100");
+  };
+
+  const salvar = () => {
+    if (!nome.trim()) return;
+    const item = {
+      id: editing.id || uid(),
+      name: nome.trim(),
+      valorInicial: parseValor(valorIni),
+      dataInicio: dataIni,
+      pctCdi: parseValor(pctCdi) || 100,
+    };
+    setData((d) => ({
+      ...d,
+      investments: editing.id ? d.investments.map((x) => (x.id === item.id ? item : x)) : [...d.investments, item],
+    }));
+    setEditing(null);
+  };
+
+  const excluir = (id) => setData((d) => ({ ...d, investments: d.investments.filter((x) => x.id !== id) }));
+
+  const salvarCdi = () => {
+    const v = parseValor(cdiField);
+    if (v > 0) setData((d) => ({ ...d, settings: { ...d.settings, cdiAnual: v } }));
+  };
+
+  const totalReserva = data.investments.reduce(
+    (acc, inv) => acc + valorInvestimento(inv, data.transactions, cdi, mkNow).atual, 0);
+
+  return (
+    <div className="space-y-4">
+      {/* Painel superior */}
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+        <Card className="p-4">
+          <p className="text-xs font-semibold text-stone-500 uppercase tracking-wide">Minha reserva total (hoje)</p>
+          <p className="text-2xl font-extrabold tabular-nums mt-1 text-blue-700">{fmtBRL(totalReserva)}</p>
+          <p className="text-xs text-stone-400 mt-1">{data.investments.length} investimento{data.investments.length !== 1 ? "s" : ""} · valores atualizados com juros compostos mensais</p>
+        </Card>
+        <Card className="p-4">
+          <p className="text-xs font-semibold text-stone-500 uppercase tracking-wide">CDI de referência (% a.a.)</p>
+          <div className="flex gap-2 mt-1.5">
+            <input className={inputCls + " max-w-28"} inputMode="decimal" value={cdiField} onChange={(e) => setCdiField(e.target.value)} />
+            <button className={btnPrimary} onClick={salvarCdi}>Atualizar</button>
+          </div>
+          <p className="text-xs text-stone-400 mt-1.5">Confira a taxa DI atual (ex.: no site da B3) e ajuste aqui — todas as projeções recalculam na hora.</p>
+        </Card>
+      </div>
+
+      <Card className="p-4">
+        <div className="flex items-center justify-between mb-3">
+          <h3 className="font-bold text-stone-700 flex items-center gap-2"><Icon d={I.chart} className="text-blue-700" /> Meus investimentos</h3>
+          <button onClick={() => abrir()} className="text-sm font-semibold text-emerald-700 hover:underline flex items-center gap-1">
+            <Icon d={I.plus} size={15} /> Novo investimento
+          </button>
+        </div>
+
+        {data.investments.length === 0 && (
+          <p className="text-sm text-stone-500 py-6 text-center">
+            Nenhum investimento ainda. Cadastre onde sua reserva está aplicada (CDB, Tesouro, poupança…) para acompanhar rendimento e projeções.
+          </p>
+        )}
+
+        <div className="space-y-3">
+          {data.investments.map((inv) => {
+            const { atual, aportado, rendimento } = valorInvestimento(inv, data.transactions, cdi, mkNow);
+            const i = taxaMensal(cdi, inv.pctCdi);
+            const aberto = expandido === inv.id;
+            const A = parseValor(simAporte);
+
+            // Projeção 12 meses (com aporte mensal simulado opcional)
+            const proj = [];
+            let v = atual;
+            proj.push({ mes: "hoje", valor: Math.round(v * 100) / 100 });
+            for (let m = 1; m <= 12; m++) {
+              v = v * (1 + i) + (aberto ? A : 0);
+              proj.push({ mes: monthLabel(shiftMonth(mkNow, m)).split(" de ")[0].slice(0, 3), valor: Math.round(v * 100) / 100 });
+            }
+
+            return (
+              <div key={inv.id} className="border border-stone-200 rounded-xl overflow-hidden">
+                <div className="p-3">
+                  <div className="flex items-center gap-2">
+                    <div className="flex-1 min-w-0">
+                      <p className="font-semibold text-stone-800">{inv.name}</p>
+                      <p className="text-xs text-stone-500">
+                        {inv.pctCdi}% do CDI · desde {new Date(inv.dataInicio + "T12:00:00").toLocaleDateString("pt-BR")} · ~{(i * 100).toFixed(2)}% a.m.
+                      </p>
+                    </div>
+                    <div className="text-right">
+                      <p className="font-extrabold tabular-nums text-blue-700">{fmtBRL(atual)}</p>
+                      <p className="text-xs tabular-nums text-emerald-700">+{fmtBRL(rendimento)} de rendimento</p>
+                    </div>
+                  </div>
+                  <p className="text-xs text-stone-400 mt-1 tabular-nums">total aportado: {fmtBRL(aportado)}</p>
+                  <div className="flex gap-2 mt-2 flex-wrap">
+                    <button onClick={() => onAportar(inv.id)} className="text-xs font-bold bg-blue-600 hover:bg-blue-700 text-white rounded-lg px-3 py-1.5 transition-colors">
+                      + Aportar
+                    </button>
+                    <button onClick={() => { setExpandido(aberto ? null : inv.id); setSimAporte(""); }}
+                      className="text-xs font-bold bg-stone-100 hover:bg-stone-200 text-stone-700 rounded-lg px-3 py-1.5 transition-colors">
+                      {aberto ? "Fechar projeção" : "Ver projeção 12 meses"}
+                    </button>
+                    <span className="ml-auto flex gap-1">
+                      <button onClick={() => abrir(inv)} className="p-1.5 rounded-lg hover:bg-stone-100 text-stone-400 hover:text-stone-700" aria-label="Editar"><Icon d={I.pencil} size={15} /></button>
+                      <button onClick={() => excluir(inv.id)} className="p-1.5 rounded-lg hover:bg-red-50 text-stone-400 hover:text-red-600" aria-label="Excluir"><Icon d={I.trash} size={15} /></button>
+                    </span>
+                  </div>
+                </div>
+
+                {aberto && (
+                  <div className="border-t border-stone-200 bg-stone-50 p-3 space-y-3">
+                    <div>
+                      <label className={labelCls}>Simular aporte mensal (R$) — opcional</label>
+                      <input className={inputCls + " max-w-48"} inputMode="decimal" placeholder="0,00" value={simAporte} onChange={(e) => setSimAporte(e.target.value)} />
+                    </div>
+                    <div className="h-52">
+                      <ResponsiveContainer width="100%" height="100%">
+                        <LineChart data={proj} margin={{ top: 5, right: 10, left: 0, bottom: 0 }}>
+                          <CartesianGrid strokeDasharray="3 3" stroke="#e7e5e4" />
+                          <XAxis dataKey="mes" tick={{ fontSize: 11 }} />
+                          <YAxis tick={{ fontSize: 10 }} domain={["auto", "auto"]} width={70}
+                            tickFormatter={(v) => "R$ " + v.toLocaleString("pt-BR")} />
+                          <Tooltip formatter={(v) => fmtBRL(v)} />
+                          <Line type="monotone" dataKey="valor" name="Projeção" stroke="#1E6B4E" strokeWidth={2.5} dot={{ r: 3 }} />
+                        </LineChart>
+                      </ResponsiveContainer>
+                    </div>
+                    <div className="overflow-x-auto">
+                      <table className="w-full text-xs">
+                        <thead>
+                          <tr className="text-stone-500">
+                            <th className="text-left py-1 font-semibold">Mês</th>
+                            <th className="text-right py-1 font-semibold">Valor projetado</th>
+                            <th className="text-right py-1 font-semibold">Rendimento no mês</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {proj.slice(1).map((p, idx) => (
+                            <tr key={idx} className="border-t border-stone-200">
+                              <td className="py-1.5 capitalize">{monthLabel(shiftMonth(mkNow, idx + 1))}</td>
+                              <td className="py-1.5 text-right tabular-nums font-semibold text-stone-700">{fmtBRL(p.valor)}</td>
+                              <td className="py-1.5 text-right tabular-nums text-emerald-700">
+                                +{fmtBRL(p.valor - proj[idx].valor - (A || 0))}
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                    <p className="text-xs text-stone-400">
+                      Projeção estimada com CDI de {cdi}% a.a. constante e capitalização mensal. Rentabilidade passada e projetada não garantem resultados futuros — cada aporte real registrado recalcula tudo automaticamente.
+                    </p>
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      </Card>
+
+      {editing !== null && (
+        <Modal title={editing.id ? "Editar investimento" : "Novo investimento"} onClose={() => setEditing(null)}>
+          <div className="space-y-4">
+            <div>
+              <label className={labelCls}>Nome / onde está aplicado</label>
+              <input className={inputCls} placeholder="Ex.: CDB Banco X, Tesouro Selic, Caixinha…" value={nome} onChange={(e) => setNome(e.target.value)} />
+            </div>
+            <div className="grid grid-cols-2 gap-3">
+              <div>
+                <label className={labelCls}>Valor inicial (R$)</label>
+                <input className={inputCls} inputMode="decimal" placeholder="400,00" value={valorIni} onChange={(e) => setValorIni(e.target.value)} />
+              </div>
+              <div>
+                <label className={labelCls}>Data de início</label>
+                <input className={inputCls} type="date" value={dataIni} onChange={(e) => setDataIni(e.target.value)} />
+              </div>
+            </div>
+            <div>
+              <label className={labelCls}>Rendimento (% do CDI)</label>
+              <input className={inputCls} inputMode="decimal" placeholder="100" value={pctCdi} onChange={(e) => setPctCdi(e.target.value)} />
+              <p className="text-xs text-stone-400 mt-1">Ex.: 100 = rende 100% do CDI; 110 = rende 110% do CDI.</p>
+            </div>
+            <div className="flex gap-2 justify-end">
+              <button className={btnGhost} onClick={() => setEditing(null)}>Cancelar</button>
+              <button className={btnPrimary} onClick={salvar}>Salvar</button>
+            </div>
+          </div>
+        </Modal>
+      )}
+    </div>
+  );
+}
+
+/* ============================================================
+   VISÃO: CONTAS & CARTÕES
+   ============================================================ */
+function ContasView({ data, setData, accountBalances, cardUsage, mesLabel }) {
+  const [editing, setEditing] = useState(null);
+  const [nome, setNome] = useState("");
+  const [valorCampo, setValorCampo] = useState("");
+
+  const abrir = (kind, item = null) => {
+    setEditing({ kind, item });
+    setNome(item ? item.name : "");
+    setValorCampo(item ? String(kind === "acc" ? item.initialBalance : item.limit).replace(".", ",") : "");
+  };
+
+  const salvar = () => {
+    if (!nome.trim()) return;
+    const v = parseValor(valorCampo);
+    setData((d) => {
+      if (editing.kind === "acc") {
+        const item = { id: editing.item ? editing.item.id : uid(), name: nome.trim(), initialBalance: v };
+        return { ...d, accounts: editing.item ? d.accounts.map((a) => (a.id === item.id ? item : a)) : [...d.accounts, item] };
+      }
+      const item = { id: editing.item ? editing.item.id : uid(), name: nome.trim(), limit: v };
+      return { ...d, cards: editing.item ? d.cards.map((c) => (c.id === item.id ? item : c)) : [...d.cards, item] };
+    });
+    setEditing(null);
+  };
+
+  const excluir = (kind, id) => {
+    setData((d) => kind === "acc"
+      ? { ...d, accounts: d.accounts.filter((a) => a.id !== id) }
+      : { ...d, cards: d.cards.filter((c) => c.id !== id) });
+  };
+
+  return (
+    <div className="space-y-4">
+      <Card className="p-4">
+        <div className="flex items-center justify-between mb-3">
+          <h3 className="font-bold text-stone-700 flex items-center gap-2"><Icon d={I.wallet} className="text-emerald-700" /> Contas bancárias</h3>
+          <button onClick={() => abrir("acc")} className="text-sm font-semibold text-emerald-700 hover:underline flex items-center gap-1"><Icon d={I.plus} size={15} /> Adicionar</button>
+        </div>
+        {data.accounts.length === 0 && <p className="text-sm text-stone-500">Nenhuma conta. Adicione a primeira para registrar transações.</p>}
+        <div className="grid sm:grid-cols-2 gap-3">
+          {data.accounts.map((a) => (
+            <div key={a.id} className="border border-stone-200 rounded-xl p-3 flex items-center justify-between">
+              <div>
+                <p className="font-semibold text-sm text-stone-800">{a.name}</p>
+                <p className={`font-extrabold tabular-nums ${accountBalances[a.id] >= 0 ? "text-emerald-700" : "text-red-600"}`}>{fmtBRL(accountBalances[a.id])}</p>
+                <p className="text-xs text-stone-400">saldo inicial {fmtBRL(a.initialBalance)}</p>
+              </div>
+              <div className="flex gap-1">
+                <button onClick={() => abrir("acc", a)} className="p-1.5 rounded-lg hover:bg-stone-100 text-stone-400 hover:text-stone-700" aria-label="Editar conta"><Icon d={I.pencil} size={15} /></button>
+                <button onClick={() => excluir("acc", a.id)} className="p-1.5 rounded-lg hover:bg-red-50 text-stone-400 hover:text-red-600" aria-label="Excluir conta"><Icon d={I.trash} size={15} /></button>
+              </div>
+            </div>
+          ))}
+        </div>
+      </Card>
+
+      <Card className="p-4">
+        <div className="flex items-center justify-between mb-3">
+          <h3 className="font-bold text-stone-700 flex items-center gap-2"><Icon d={I.card} className="text-emerald-700" /> Cartões de crédito</h3>
+          <button onClick={() => abrir("card")} className="text-sm font-semibold text-emerald-700 hover:underline flex items-center gap-1"><Icon d={I.plus} size={15} /> Adicionar</button>
+        </div>
+        {data.cards.length === 0 && <p className="text-sm text-stone-500">Nenhum cartão cadastrado. Adicione um para controlar o limite disponível.</p>}
+        <div className="grid sm:grid-cols-2 gap-3">
+          {data.cards.map((c) => {
+            const usado = cardUsage[c.id] || 0;
+            const disponivel = c.limit - usado;
+            const pct = c.limit > 0 ? Math.min((usado / c.limit) * 100, 100) : 0;
+            const barCls = pct >= 90 ? "bg-red-600" : pct >= 70 ? "bg-amber-500" : "bg-emerald-600";
+            return (
+              <div key={c.id} className="border border-stone-200 rounded-xl p-3">
+                <div className="flex items-center justify-between">
+                  <p className="font-semibold text-sm text-stone-800">{c.name}</p>
+                  <div className="flex gap-1">
+                    <button onClick={() => abrir("card", c)} className="p-1.5 rounded-lg hover:bg-stone-100 text-stone-400 hover:text-stone-700" aria-label="Editar cartão"><Icon d={I.pencil} size={15} /></button>
+                    <button onClick={() => excluir("card", c.id)} className="p-1.5 rounded-lg hover:bg-red-50 text-stone-400 hover:text-red-600" aria-label="Excluir cartão"><Icon d={I.trash} size={15} /></button>
+                  </div>
+                </div>
+                <div className="h-2.5 w-full bg-stone-200 rounded-full overflow-hidden mt-2">
+                  <div className={`h-full rounded-full ${barCls} transition-all duration-500`} style={{ width: pct + "%" }} />
+                </div>
+                <div className="flex justify-between mt-1.5 text-xs">
+                  <span className="text-stone-500 tabular-nums">usado {fmtBRL(usado)}</span>
+                  <span className={`font-bold tabular-nums ${disponivel < 0 ? "text-red-600" : "text-emerald-700"}`}>disponível {fmtBRL(disponivel)}</span>
+                </div>
+                <p className="text-xs text-stone-400 mt-1 tabular-nums">limite total {fmtBRL(c.limit)} · fatura de {mesLabel}</p>
+              </div>
+            );
+          })}
+        </div>
+      </Card>
+
+      {editing && (
+        <Modal title={editing.item ? (editing.kind === "acc" ? "Editar conta" : "Editar cartão") : (editing.kind === "acc" ? "Nova conta" : "Novo cartão")} onClose={() => setEditing(null)}>
+          <div className="space-y-4">
+            <div>
+              <label className={labelCls}>Nome</label>
+              <input className={inputCls} placeholder={editing.kind === "acc" ? "Ex.: Nubank, BB, Caixa…" : "Ex.: Cartão Nubank"} value={nome} onChange={(e) => setNome(e.target.value)} />
+            </div>
+            <div>
+              <label className={labelCls}>{editing.kind === "acc" ? "Saldo inicial (R$)" : "Limite total (R$)"}</label>
+              <input className={inputCls} inputMode="decimal" placeholder="0,00" value={valorCampo} onChange={(e) => setValorCampo(e.target.value)} />
+            </div>
+            <div className="flex gap-2 justify-end">
+              <button className={btnGhost} onClick={() => setEditing(null)}>Cancelar</button>
+              <button className={btnPrimary} onClick={salvar}>Salvar</button>
+            </div>
+          </div>
+        </Modal>
+      )}
+    </div>
+  );
+}
+
+/* ============================================================
+   VISÃO: CATEGORIAS & TETOS
+   ============================================================ */
+function CategoriasView({ data, setData, gastoPorCategoria, monthTxs }) {
+  const [editing, setEditing] = useState(null);
+  const [nome, setNome] = useState("");
+  const [teto, setTeto] = useState("");
+  const [subsTxt, setSubsTxt] = useState("");
+
+  const abrir = (cat = null) => {
+    setEditing(cat || {});
+    setNome(cat ? cat.name : "");
+    setTeto(cat && cat.teto ? String(cat.teto).replace(".", ",") : "");
+    setSubsTxt(cat && cat.subs ? cat.subs.join(", ") : "");
+  };
+
+  const salvar = () => {
+    if (!nome.trim()) return;
+    const item = {
+      id: editing.id || uid(),
+      name: nome.trim(),
+      teto: parseValor(teto),
+      subs: subsTxt.split(",").map((s) => s.trim()).filter(Boolean),
+    };
+    setData((d) => ({
+      ...d,
+      categories: editing.id ? d.categories.map((c) => (c.id === item.id ? item : c)) : [...d.categories, item],
+    }));
+    setEditing(null);
+  };
+
+  const excluir = (id) => setData((d) => ({ ...d, categories: d.categories.filter((c) => c.id !== id) }));
+
+  const gastoSub = (catId) => {
+    const map = {};
+    for (const t of monthTxs) {
+      if (t.type !== "despesa" || t.categoriaId !== catId) continue;
+      const k = t.subcategoria || "Geral";
+      map[k] = (map[k] || 0) + t.valor;
+    }
+    return map;
+  };
+
+  return (
+    <div className="space-y-4">
+      <Card className="p-4">
+        <div className="flex items-center justify-between mb-4">
+          <h3 className="font-bold text-stone-700 flex items-center gap-2"><Icon d={I.tag} className="text-emerald-700" /> Categorias e tetos de gastos</h3>
+          <button onClick={() => abrir()} className="text-sm font-semibold text-emerald-700 hover:underline flex items-center gap-1"><Icon d={I.plus} size={15} /> Nova categoria</button>
+        </div>
+        <div className="space-y-5">
+          {data.categories.map((c) => {
+            const gasto = gastoPorCategoria[c.id] || 0;
+            const subs = gastoSub(c.id);
+            return (
+              <div key={c.id} className="border border-stone-200 rounded-xl p-3">
+                <div className="flex items-center gap-2 mb-2">
+                  <span className="font-semibold text-stone-800">{c.name}</span>
+                  {c.teto > 0 && gasto >= c.teto && <Icon d={I.alert} size={15} className="text-red-600" />}
+                  <div className="ml-auto flex gap-1">
+                    <button onClick={() => abrir(c)} className="p-1.5 rounded-lg hover:bg-stone-100 text-stone-400 hover:text-stone-700" aria-label="Editar categoria"><Icon d={I.pencil} size={15} /></button>
+                    <button onClick={() => excluir(c.id)} className="p-1.5 rounded-lg hover:bg-red-50 text-stone-400 hover:text-red-600" aria-label="Excluir categoria"><Icon d={I.trash} size={15} /></button>
+                  </div>
+                </div>
+                <ProgressBar gasto={gasto} teto={c.teto} />
+                {c.subs && c.subs.length > 0 && Object.keys(subs).length > 0 && (
+                  <div className="mt-2 pl-3 border-l-2 border-stone-200 space-y-0.5">
+                    {Object.entries(subs).map(([s, v]) => (
+                      <p key={s} className="text-xs text-stone-500 flex justify-between">
+                        <span>{s}</span>
+                        <span className="tabular-nums font-medium">{fmtBRL(v)}</span>
+                      </p>
+                    ))}
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      </Card>
+
+      {editing !== null && (
+        <Modal title={editing.id ? "Editar categoria" : "Nova categoria"} onClose={() => setEditing(null)}>
+          <div className="space-y-4">
+            <div>
+              <label className={labelCls}>Nome da categoria</label>
+              <input className={inputCls} placeholder="Ex.: Saúde, Educação…" value={nome} onChange={(e) => setNome(e.target.value)} />
+            </div>
+            <div>
+              <label className={labelCls}>Teto mensal (R$) — deixe vazio para não limitar</label>
+              <input className={inputCls} inputMode="decimal" placeholder="0,00" value={teto} onChange={(e) => setTeto(e.target.value)} />
+            </div>
+            <div>
+              <label className={labelCls}>Detalhes / subcategorias (separadas por vírgula)</label>
+              <input className={inputCls} placeholder="Ex.: Financiamento, Seguro, Gasolina" value={subsTxt} onChange={(e) => setSubsTxt(e.target.value)} />
+            </div>
+            <div className="flex gap-2 justify-end">
+              <button className={btnGhost} onClick={() => setEditing(null)}>Cancelar</button>
+              <button className={btnPrimary} onClick={salvar}>Salvar</button>
+            </div>
+          </div>
+        </Modal>
+      )}
+    </div>
+  );
+}
+
+/* ============================================================
+   APP PRINCIPAL
+   ============================================================ */
+function FinancasApp() {
+  const [data, setData] = useState(null);
+  const [tab, setTab] = useState("dashboard");
+  const [mes, setMes] = useState(monthKey(todayISO()));
+  const [showTxForm, setShowTxForm] = useState(false);
+  const [editingTx, setEditingTx] = useState(null);
+  const [aporteInvId, setAporteInvId] = useState("");
+  const [saveState, setSaveState] = useState("idle");
+
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem(STORAGE_KEY);
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        setData({ ...DEFAULT_DATA, ...parsed, settings: { ...DEFAULT_DATA.settings, ...(parsed.settings || {}) } });
+        return;
+      }
+    } catch (e) { /* primeiro uso ou dado corrompido */ }
+    setData(DEFAULT_DATA);
+  }, []);
+
+  useEffect(() => {
+    if (!data) return;
+    const t = setTimeout(() => {
+      try {
+        setSaveState("saving");
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
+        setSaveState("saved");
+        setTimeout(() => setSaveState("idle"), 1500);
+      } catch (e) { setSaveState("error"); }
+    }, 300);
+    return () => clearTimeout(t);
+  }, [data]);
+
+  const currentMk = monthKey(todayISO());
+  const monthTxs = useMemo(() => (data ? txsForMonth(data.transactions, mes) : []), [data, mes]);
+
+  const totais = useMemo(() => {
+    let receitas = 0, despesas = 0, investimentos = 0;
+    for (const t of monthTxs) {
+      if (t.type === "receita") receitas += t.valor;
+      else if (t.type === "despesa") despesas += t.valor;
+      else investimentos += t.valor;
+    }
+    return { receitas, despesas, investimentos, saldo: receitas - despesas - investimentos };
+  }, [monthTxs]);
+
+  const gastoPorCategoria = useMemo(() => {
+    const map = {};
+    for (const t of monthTxs) {
+      if (t.type !== "despesa") continue;
+      const key = t.categoriaId || "sem";
+      map[key] = (map[key] || 0) + t.valor;
+    }
+    return map;
+  }, [monthTxs]);
+
+  const pieData = useMemo(() => {
+    if (!data) return [];
+    return Object.entries(gastoPorCategoria)
+      .map(([catId, valor]) => ({
+        name: (data.categories.find((c) => c.id === catId) || {}).name || "Sem categoria",
+        value: valor,
+      }))
+      .sort((a, b) => b.value - a.value);
+  }, [gastoPorCategoria, data]);
+
+  const barData = useMemo(() => {
+    if (!data) return [];
+    const arr = [];
+    for (let i = 5; i >= 0; i--) {
+      const mk = shiftMonth(mes, -i);
+      const txs = txsForMonth(data.transactions, mk);
+      let r = 0, d = 0;
+      for (const t of txs) {
+        if (t.type === "receita") r += t.valor;
+        else if (t.type === "despesa") d += t.valor;
+      }
+      arr.push({ mes: monthLabel(mk).split(" de ")[0].slice(0, 3), Receitas: r, Despesas: d });
+    }
+    return arr;
+  }, [data, mes]);
+
+  const accountBalances = useMemo(() => {
+    if (!data) return {};
+    const bal = {};
+    for (const a of data.accounts) bal[a.id] = a.initialBalance;
+    for (const t of data.transactions) {
+      if (!t.contaId || !t.contaId.startsWith("acc:")) continue;
+      const accId = t.contaId.slice(4);
+      if (!(accId in bal)) continue;
+      const n = occurrencesUpTo(t, currentMk);
+      if (n === 0) continue;
+      const sinal = t.type === "receita" ? 1 : -1;
+      bal[accId] += sinal * t.valor * n;
+    }
+    return bal;
+  }, [data, currentMk]);
+
+  const cardUsage = useMemo(() => {
+    if (!data) return {};
+    const use = {};
+    for (const c of data.cards) use[c.id] = 0;
+    for (const t of monthTxs) {
+      if (t.type !== "despesa" || !t.contaId || !t.contaId.startsWith("card:")) continue;
+      const cid = t.contaId.slice(5);
+      if (cid in use) use[cid] += t.valor;
+    }
+    return use;
+  }, [data, monthTxs]);
+
+  const reservaTotal = useMemo(() => {
+    if (!data) return 0;
+    return data.investments.reduce(
+      (acc, inv) => acc + valorInvestimento(inv, data.transactions, data.settings.cdiAnual, currentMk).atual, 0);
+  }, [data, currentMk]);
+
+  if (!data) {
+    return <div className="min-h-screen flex items-center justify-center"><p className="text-stone-500 font-medium">Carregando suas finanças…</p></div>;
+  }
+
+  const saveTx = (tx) => {
+    setData((d) => {
+      const exists = d.transactions.some((t) => t.id === tx.id);
+      return { ...d, transactions: exists ? d.transactions.map((t) => (t.id === tx.id ? tx : t)) : [tx, ...d.transactions] };
+    });
+  };
+  const deleteTx = (id) => setData((d) => ({ ...d, transactions: d.transactions.filter((t) => t.id !== id) }));
+
+  const contaNome = (contaId) => {
+    if (!contaId) return "—";
+    if (contaId.startsWith("acc:")) return (data.accounts.find((a) => a.id === contaId.slice(4)) || {}).name || "Conta removida";
+    return (data.cards.find((c) => c.id === contaId.slice(5)) || {}).name || "Cartão removido";
+  };
+
+  const abrirAporte = (invId) => {
+    setAporteInvId(invId);
+    setEditingTx(null);
+    setShowTxForm(true);
+  };
+
+  const tabs = [
+    { key: "dashboard", label: "Visão Geral", short: "Início", icon: I.dash },
+    { key: "transacoes", label: "Transações", short: "Lançtos", icon: I.list },
+    { key: "investimentos", label: "Investimentos", short: "Investir", icon: I.chart },
+    { key: "contas", label: "Contas", short: "Contas", icon: I.wallet },
+    { key: "categorias", label: "Categorias", short: "Tetos", icon: I.tag },
+  ];
+
+  return (
+    <div className="min-h-screen bg-stone-100 text-stone-800">
+      {/* ===== Cabeçalho ===== */}
+      <header className="bg-emerald-900 text-white">
+        <div className="max-w-5xl mx-auto px-4 py-4 flex items-center justify-between gap-2">
+          <div className="flex items-center gap-2.5">
+            <Icon d={I.pig} size={26} className="text-emerald-300" />
+            <div>
+              <h1 className="font-extrabold text-lg leading-tight tracking-tight">Meu Cofre</h1>
+              <p className="text-emerald-200 text-xs">gestão financeira pessoal</p>
+            </div>
+          </div>
+          <div className="flex items-center gap-3">
+            <span className={`text-xs font-medium ${saveState === "error" ? "text-red-300" : "text-emerald-300"}`}>
+              {saveState === "saving" && "salvando…"}
+              {saveState === "saved" && <span className="inline-flex items-center gap-1"><Icon d={I.check} size={12} /> salvo</span>}
+              {saveState === "error" && "erro ao salvar"}
+            </span>
+            <nav className="hidden md:flex gap-1 bg-emerald-800 rounded-xl p-1">
+              {tabs.map((t) => (
+                <button key={t.key} onClick={() => setTab(t.key)}
+                  className={`px-3 py-1.5 rounded-lg text-sm font-semibold transition-colors ${tab === t.key ? "bg-white text-emerald-900" : "text-emerald-100 hover:bg-emerald-700"}`}>
+                  {t.label}
+                </button>
+              ))}
+            </nav>
+          </div>
+        </div>
+      </header>
+
+      {/* ===== Seletor de mês ===== */}
+      <div className="max-w-5xl mx-auto px-4 pt-4">
+        <div className="flex items-center justify-center gap-2">
+          <button onClick={() => setMes(shiftMonth(mes, -1))} className="p-2 rounded-full hover:bg-stone-200" aria-label="Mês anterior"><Icon d={I.left} size={20} /></button>
+          <span className="font-bold text-stone-700 capitalize min-w-40 text-center">{monthLabel(mes)}</span>
+          <button onClick={() => setMes(shiftMonth(mes, 1))} className="p-2 rounded-full hover:bg-stone-200" aria-label="Próximo mês"><Icon d={I.right} size={20} /></button>
+          {mes !== currentMk && (
+            <button onClick={() => setMes(currentMk)} className="text-xs font-semibold text-emerald-700 hover:underline ml-1">hoje</button>
+          )}
+        </div>
+      </div>
+
+      <main className="max-w-5xl mx-auto px-4 py-4 pb-32 md:pb-10 space-y-4">
+        {/* ===== VISÃO GERAL ===== */}
+        {tab === "dashboard" && (
+          <React.Fragment>
+            <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+              <Card className="p-4">
+                <p className="text-xs font-semibold text-stone-500 uppercase tracking-wide">Saldo do mês</p>
+                <p className={`text-xl md:text-2xl font-extrabold tabular-nums mt-1 ${totais.saldo >= 0 ? "text-emerald-700" : "text-red-600"}`}>{fmtBRL(totais.saldo)}</p>
+              </Card>
+              <Card className="p-4">
+                <p className="text-xs font-semibold text-stone-500 uppercase tracking-wide flex items-center gap-1"><Icon d={I.trendUp} size={13} className="text-emerald-600" /> Receitas</p>
+                <p className="text-xl md:text-2xl font-extrabold tabular-nums mt-1 text-emerald-700">{fmtBRL(totais.receitas)}</p>
+              </Card>
+              <Card className="p-4">
+                <p className="text-xs font-semibold text-stone-500 uppercase tracking-wide flex items-center gap-1"><Icon d={I.trendDown} size={13} className="text-red-500" /> Despesas</p>
+                <p className="text-xl md:text-2xl font-extrabold tabular-nums mt-1 text-red-600">{fmtBRL(totais.despesas)}</p>
+              </Card>
+              <Card className="p-4 cursor-pointer hover:border-blue-300 transition-colors" onClick={() => setTab("investimentos")}>
+                <p className="text-xs font-semibold text-stone-500 uppercase tracking-wide">Minha reserva</p>
+                <p className="text-xl md:text-2xl font-extrabold tabular-nums mt-1 text-blue-600">{fmtBRL(reservaTotal)}</p>
+                <p className="text-xs text-stone-400">aportado no mês: {fmtBRL(totais.investimentos)}</p>
+              </Card>
+            </div>
+
+            <div className="grid md:grid-cols-2 gap-4">
+              <Card className="p-4">
+                <h3 className="font-bold text-stone-700 mb-2">Para onde o dinheiro está indo</h3>
+                {pieData.length === 0 ? (
+                  <p className="text-sm text-stone-500 py-10 text-center">Nenhuma despesa neste mês ainda. Toque em <strong>+ Nova</strong> para registrar a primeira.</p>
+                ) : (
+                  <div className="h-64">
+                    <ResponsiveContainer width="100%" height="100%">
+                      <PieChart>
+                        <Pie data={pieData} dataKey="value" nameKey="name" innerRadius={50} outerRadius={85} paddingAngle={2}>
+                          {pieData.map((_, i) => <Cell key={i} fill={PIE_COLORS[i % PIE_COLORS.length]} />)}
+                        </Pie>
+                        <Tooltip formatter={(v) => fmtBRL(v)} />
+                        <Legend iconSize={10} wrapperStyle={{ fontSize: 12 }} />
+                      </PieChart>
+                    </ResponsiveContainer>
+                  </div>
+                )}
+              </Card>
+
+              <Card className="p-4">
+                <h3 className="font-bold text-stone-700 mb-2">Evolução — últimos 6 meses</h3>
+                <div className="h-64">
+                  <ResponsiveContainer width="100%" height="100%">
+                    <BarChart data={barData} margin={{ top: 5, right: 5, left: -15, bottom: 0 }}>
+                      <XAxis dataKey="mes" tick={{ fontSize: 12 }} />
+                      <YAxis tick={{ fontSize: 11 }} />
+                      <Tooltip formatter={(v) => fmtBRL(v)} />
+                      <Legend iconSize={10} wrapperStyle={{ fontSize: 12 }} />
+                      <Bar dataKey="Receitas" fill="#1E6B4E" radius={[4, 4, 0, 0]} />
+                      <Bar dataKey="Despesas" fill="#C6423C" radius={[4, 4, 0, 0]} />
+                    </BarChart>
+                  </ResponsiveContainer>
+                </div>
+              </Card>
+            </div>
+
+            <Card className="p-4">
+              <div className="flex items-center justify-between mb-3">
+                <h3 className="font-bold text-stone-700">Tetos de gastos do mês</h3>
+                <button onClick={() => setTab("categorias")} className="text-sm font-semibold text-emerald-700 hover:underline">gerenciar</button>
+              </div>
+              <div className="space-y-4">
+                {data.categories.filter((c) => c.teto > 0 || gastoPorCategoria[c.id]).length === 0 ? (
+                  <p className="text-sm text-stone-500">Defina tetos na aba <strong>Categorias</strong> para acompanhar seus limites aqui.</p>
+                ) : (
+                  data.categories.filter((c) => c.teto > 0 || gastoPorCategoria[c.id]).map((c) => {
+                    const gasto = gastoPorCategoria[c.id] || 0;
+                    const estourou = c.teto > 0 && gasto >= c.teto;
+                    return (
+                      <div key={c.id}>
+                        <div className="flex items-center gap-2 mb-1">
+                          <span className="text-sm font-semibold text-stone-700">{c.name}</span>
+                          {estourou && <Icon d={I.alert} size={14} className="text-red-600" />}
+                          {c.teto > 0 && <span className="text-xs text-stone-400 tabular-nums ml-auto">teto {fmtBRL(c.teto)}</span>}
+                        </div>
+                        <ProgressBar gasto={gasto} teto={c.teto} />
+                      </div>
+                    );
+                  })
+                )}
+              </div>
+            </Card>
+          </React.Fragment>
+        )}
+
+        {/* ===== TRANSAÇÕES ===== */}
+        {tab === "transacoes" && (
+          <Card className="divide-y divide-stone-100">
+            <div className="p-4 flex items-center justify-between">
+              <h3 className="font-bold text-stone-700 capitalize">Transações de {monthLabel(mes)}</h3>
+              <span className="text-xs text-stone-400">{monthTxs.length} lançamento{monthTxs.length !== 1 ? "s" : ""}</span>
+            </div>
+            {monthTxs.length === 0 && (
+              <p className="p-8 text-center text-sm text-stone-500">Nada registrado neste mês. Use o botão <strong>+ Nova</strong> para começar.</p>
+            )}
+            {monthTxs.map((t) => {
+              const cat = data.categories.find((c) => c.id === t.categoriaId);
+              const inv = t.investimentoId ? data.investments.find((x) => x.id === t.investimentoId) : null;
+              const cor = t.type === "receita" ? "text-emerald-700" : t.type === "investimento" ? "text-blue-600" : "text-red-600";
+              const sinal = t.type === "receita" ? "+" : "−";
+              return (
+                <div key={t.id + "-" + t.data} className="px-4 py-3 flex items-center gap-3">
+                  <div className="flex-1 min-w-0">
+                    <p className="font-semibold text-sm text-stone-800 truncate flex items-center gap-1.5">
+                      {t.descricao}
+                      {t.recorrente && <Icon d={I.repeat} size={13} className="text-stone-400" />}
+                      {t.projected && <span className="text-xs font-medium bg-stone-100 text-stone-500 rounded-full px-2 py-0.5">recorrente</span>}
+                    </p>
+                    <p className="text-xs text-stone-500 truncate">
+                      {new Date(t.data + "T12:00:00").toLocaleDateString("pt-BR")} · {contaNome(t.contaId)}
+                      {cat ? ` · ${cat.name}${t.subcategoria ? " / " + t.subcategoria : ""}` : ""}
+                      {inv ? ` · ${inv.name}` : ""}
+                    </p>
+                  </div>
+                  <span className={`font-bold tabular-nums text-sm ${cor}`}>{sinal} {fmtBRL(t.valor)}</span>
+                  <div className="flex gap-1 shrink-0">
+                    <button onClick={() => { setEditingTx(data.transactions.find((x) => x.id === t.id)); setAporteInvId(""); setShowTxForm(true); }}
+                      className="p-1.5 rounded-lg hover:bg-stone-100 text-stone-400 hover:text-stone-700" aria-label="Editar"><Icon d={I.pencil} size={15} /></button>
+                    <button onClick={() => deleteTx(t.id)} className="p-1.5 rounded-lg hover:bg-red-50 text-stone-400 hover:text-red-600" aria-label="Excluir"><Icon d={I.trash} size={15} /></button>
+                  </div>
+                </div>
+              );
+            })}
+          </Card>
+        )}
+
+        {/* ===== INVESTIMENTOS ===== */}
+        {tab === "investimentos" && (
+          <InvestimentosView data={data} setData={setData} onAportar={abrirAporte} />
+        )}
+
+        {/* ===== CONTAS ===== */}
+        {tab === "contas" && (
+          <ContasView data={data} setData={setData} accountBalances={accountBalances} cardUsage={cardUsage} mesLabel={monthLabel(mes)} />
+        )}
+
+        {/* ===== CATEGORIAS ===== */}
+        {tab === "categorias" && (
+          <CategoriasView data={data} setData={setData} gastoPorCategoria={gastoPorCategoria} monthTxs={monthTxs} />
+        )}
+      </main>
+
+      {/* ===== Botão flutuante ===== */}
+      <button onClick={() => { setEditingTx(null); setAporteInvId(""); setShowTxForm(true); }}
+        className="fixed bottom-20 md:bottom-8 right-4 md:right-8 bg-emerald-700 hover:bg-emerald-800 text-white rounded-full shadow-lg px-5 py-3.5 flex items-center gap-2 font-bold z-40 transition-colors">
+        <Icon d={I.plus} size={20} /> Nova
+      </button>
+
+      {/* ===== Navegação mobile ===== */}
+      <nav className="md:hidden fixed bottom-0 inset-x-0 bg-white border-t border-stone-200 flex z-40">
+        {tabs.map((t) => {
+          const active = tab === t.key;
+          return (
+            <button key={t.key} onClick={() => setTab(t.key)}
+              className={`flex-1 flex flex-col items-center gap-0.5 py-2.5 text-xs font-semibold ${active ? "text-emerald-700" : "text-stone-400"}`}>
+              <Icon d={t.icon} size={20} />
+              {t.short}
+            </button>
+          );
+        })}
+      </nav>
+
+      {/* ===== Modal de transação / aporte ===== */}
+      {showTxForm && (
+        <Modal title={editingTx ? "Editar transação" : (aporteInvId ? "Novo aporte" : "Nova transação")} onClose={() => setShowTxForm(false)}>
+          <TransactionForm
+            data={data}
+            initial={editingTx || (aporteInvId ? { id: null, type: "investimento", valor: "", data: todayISO(), descricao: "Aporte", contaId: data.accounts[0] ? "acc:" + data.accounts[0].id : "", categoriaId: "", subcategoria: "", investimentoId: aporteInvId, recorrente: false } : null)}
+            onSave={saveTx}
+            onClose={() => setShowTxForm(false)}
+          />
+        </Modal>
+      )}
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<FinancasApp />);
+</script>
+</body>
+</html>
